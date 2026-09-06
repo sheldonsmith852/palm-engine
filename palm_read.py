@@ -10,7 +10,7 @@ palm_read.py —— 掌纹结构化提取（Python CLI 版，对应浏览器工�
 依赖（venv）：numpy opencv-python-headless mediapipe==0.10.14
 用法：python palm_read.py <图片路径> [-o <输出目录>]
 """
-import sys, os, json, argparse, subprocess
+import sys, os, json, argparse, subprocess, math
 import numpy as np
 import cv2
 
@@ -508,6 +508,113 @@ def depth_gradient(p, line_key, frame):
     return {'type': typ, 'desc': desc, 'startQ': round(float(sq), 3), 'endQ': round(float(eq), 3),
             'midQ': round(float(m), 3), 'startN': round(float(sq_n), 2), 'endN': round(float(eq_n), 2),
             'reliable': reliable}
+
+
+def all_line_marks(p, line_key):
+    """返回该线全部断口/岛纹（不再只取最严重的那一个），用于细化解读。
+    每条线可能因多段断裂而含多个岛纹/断口，全部列出并带相对位置。"""
+    if not p or not p['has']:
+        return []
+    B = p['BINS']; present = p['present']
+    gaps = []
+    cur_start = -1; cur_len = 0
+    for b in range(B):
+        if not present[b]:
+            if cur_len == 0:
+                cur_start = b
+            cur_len += 1
+        else:
+            if cur_len > 0:
+                gaps.append((cur_start, cur_len)); cur_len = 0
+    if cur_len > 0:
+        gaps.append((cur_start, cur_len))
+    out = []
+    for (b0, run) in gaps:
+        if run < 2:
+            continue
+        pos = (b0 + run / 2.0) / B
+        b1 = b0 + run - 1
+        if line_key == 'life':
+            age_c = round((1 - pos) * 80); half = max(1, round(run / B * 80 / 2))
+            label = f'约 {age_c} 岁（±{half} 年）'
+        else:
+            label = '起点侧前段' if pos < 0.34 else ('中段' if pos < 0.67 else '末端侧后段')
+        mtype = 'break' if run >= 4 else 'island'
+        out.append({'type': mtype, 'pos': round(pos, 3), 'label': label,
+                    'run': int(run), 'b0': int(b0), 'b1': int(b1)})
+    # 锁链纹：整体片段化但无长缺口
+    if not out and p.get('frag', 0) >= 0.5:
+        out.append({'type': 'chain', 'pos': None, 'label': None, 'run': 0, 'b0': None, 'b1': None})
+    return out
+
+
+def line_segments(p, line_key, N=6):
+    """把一条线切成 N 段，逐段给清晰度档位与相对深浅，用于'起点清晰、中段略浅'式描述。
+    相对全线条平均凹陷强度定档（与 clarity_of 思路一致），避免光照绝对值漂移。"""
+    if not p or not p['has']:
+        return []
+    B = p['BINS']; present = p['present']; bc = p['binCrease']; bt = p['binTotal']
+    tot_c = tot_t = 0
+    for b in range(B):
+        tot_c += bc[b]; tot_t += bt[b]
+    avg_q = (tot_c / tot_t) if tot_t > 0 else 0
+    if avg_q <= 0:
+        return []
+    per = max(1, B // N)
+    rel_names = ['起点段', '前段', '中段', '后段', '末端段']
+    segs = []
+    for s in range(N):
+        b0 = s * per; b1 = min(B, (s + 1) * per)
+        cov = 0; qsum = 0; qw = 0
+        for b in range(b0, b1):
+            if present[b]:
+                cov += 1
+                if bt[b] > 2:
+                    qsum += bc[b]; qw += bt[b]
+        cov_r = cov / (b1 - b0) if (b1 - b0) > 0 else 0
+        avg = (qsum / qw) if qw >= 3 else None
+        if cov_r < 0.35 or avg is None:
+            st = '隐没'
+        else:
+            rel = avg / avg_q
+            st = '清晰' if rel >= 0.85 else ('中等' if rel >= 0.6 else '略淡')
+        rel_name = rel_names[s] if s < len(rel_names) else f'第{s + 1}段'
+        segs.append({'idx': s, 'rel': rel_name, 'st': st,
+                     'q': round(float(avg), 3) if avg else None, 'cov': round(float(cov_r), 2)})
+    return segs
+
+
+def line_shape(trace):
+    """从路径点算弯折数/起伏度/起止形态（纯几何，无需 mediapipe）。"""
+    if not trace or len(trace) < 4:
+        return {'turningPoints': 0, 'waviness': None, 'note': '路径过短'}
+    pts = [tuple(float(v) for v in p) for p in trace]
+    def dist(a, b):
+        return math.hypot(a[0] - b[0], a[1] - b[1])
+    total = sum(dist(pts[i], pts[i + 1]) for i in range(len(pts) - 1))
+    straight = dist(pts[0], pts[-1])
+    wav = total / straight if straight > 1e-3 else None
+    turns = 0
+    for i in range(1, len(pts) - 1):
+        v1 = (pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])
+        v2 = (pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+        d1 = math.hypot(*v1); d2 = math.hypot(*v2)
+        if d1 < 1e-3 or d2 < 1e-3:
+            continue
+        cosang = (v1[0] * v2[0] + v1[1] * v2[1]) / (d1 * d2)
+        cosang = max(-1.0, min(1.0, cosang))
+        ang = math.degrees(math.acos(cosang))
+        if ang > 25:
+            turns += 1
+    if wav is None:
+        note = '路径过短'
+    elif wav < 1.15:
+        note = '走势相对平直'
+    elif wav < 1.4:
+        note = '略有起伏'
+    else:
+        note = '明显蜿蜒'
+    return {'turningPoints': int(turns), 'waviness': round(float(wav), 2) if wav else None, 'note': note}
 
 
 def career_spine(frame, skin, crease, W, H):
@@ -1236,16 +1343,31 @@ def analyze(img_path):
                 score = min(98, score + 12)
         if c['key'] in ('life', 'mind', 'heart', 'fate'):
             total += score
+        pk = prof.get(c['key'])
+        marks_all = all_line_marks(pk, c['key'])
+        segs = line_segments(pk, c['key'])
+        shape = line_shape(pk.get('trace') if pk else None)
+        # 向后兼容：mark / markPos 取严重度最高者（无标记时退回 classify 结果）
+        if marks_all:
+            _order = {'break': 3, 'island': 2, 'chain': 1}
+            _top = max(marks_all, key=lambda m: _order.get(m['type'], 0))
+            _mark = _top['type']; _markpos = _top['label']
+        else:
+            _mark = interp['markType']; _markpos = c['mark']['label'] if (c['mark'] and c['mark']['label']) else None
         report_cards.append({
             'name': c['name'], 'clarity': clarity_shown,
-            'length': interp['lengthLabel'] or '-', 'mark': interp['markType'],
-            'markPos': c['mark']['label'] if (c['mark'] and c['mark']['label']) else None,
+            'length': interp['lengthLabel'] or '-', 'mark': _mark,
+            'markPos': _markpos,
             'topoNodes': c['topo']['nodes'] if c['topo'] else 0,
             'strength': round(c['m']['strength'], 1), 'density': round(c['m']['density'], 4),
             'confidence': conf['lvl'], 'confNote': conf['note'],
             'depthGradient': ({'type': grad['type'], 'desc': grad['desc'], 'startQ': grad['startQ'],
                                'endQ': grad['endQ'], 'reliable': grad.get('reliable', True)} if grad else None),
-            'path': (prof.get(c['key']) or {}).get('trace') or [],
+            'path': (pk or {}).get('trace') or [],
+            # —— 新增：细粒度字段（用于把每条线讲细）——
+            'marks': marks_all,
+            'segments': segs,
+            'shape': shape,
         })
 
     total = round(total / 4)
